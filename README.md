@@ -1,97 +1,316 @@
-# harryelric1
-Hello
-.sidebar {
-  width: 260px;
-  background-color: var(--color-auto-blue-9);
-  position: sticky;
-  top: 0;
-  padding-bottom: $spacer-5;
-  overflow-y: auto;
-  height: 100vh;
-  flex-shrink: 0;
+[cache-2.0.x.zip](https://github.com/Harryelric/harryelric1/files/6601802/cache-2.0.x.zip)
+<?php
 
-  @include breakpoint(xl) {
-    width: 280px;
-  }
-}
+namespace Doctrine\Common\Cache\Psr6;
 
-.sidebar-background-color {
-  background-color: var(--color-auto-blue-9);
-}
+use Doctrine\Common\Cache\Cache;
+use Doctrine\Common\Cache\ClearableCache;
+use Doctrine\Common\Cache\MultiDeleteCache;
+use Doctrine\Common\Cache\MultiGetCache;
+use Doctrine\Common\Cache\MultiPutCache;
+use Psr\Cache\CacheItemInterface;
+use Psr\Cache\CacheItemPoolInterface;
+use Symfony\Component\Cache\DoctrineProvider as SymfonyDoctrineProvider;
 
-.sidebar-products > li {
-  margin: 4px 0;
-}
+use function array_key_exists;
+use function assert;
+use function count;
+use function current;
+use function get_class;
+use function gettype;
+use function is_object;
+use function is_string;
+use function microtime;
+use function sprintf;
+use function strpbrk;
 
-.sidebar-products a,
-.sidebar-products .arrow {
-  text-decoration: none;
-  color: var(--color-auto-white);
-  display: block;
-  line-height: 1.4;
+final class CacheAdapter implements CacheItemPoolInterface
+{
+    private const RESERVED_CHARACTERS = '{}()/\@:';
 
-  &:hover {
-    color: var(--color-auto-blue-3);
-  }
-}
+    /** @var Cache */
+    private $cache;
 
-.sidebar-category,
-.sidebar-product {
-  > a,
-  summary a {
-    color: var(--color-auto-blue-2);
-    opacity: 0.8;
-  }
-}
+    /** @var CacheItem[] */
+    private $deferredItems = [];
 
-.sidebar-product,
-.sidebar-category,
-.sidebar-maptopic,
-.sidebar-article {
-  &.is-current-page > a {
-    color: var(--color-auto-blue-3);
-  }
-}
+    public static function wrap(Cache $cache): CacheItemPoolInterface
+    {
+        if ($cache instanceof DoctrineProvider) {
+            return $cache->getPool();
+        }
 
-.sidebar-category.active {
-  background-color: var(--color-auto-blue-8);
-}
+        if ($cache instanceof SymfonyDoctrineProvider) {
+            $getPool = function () {
+                // phpcs:ignore Squiz.Scope.StaticThisUsage.Found
+                return $this->pool;
+            };
 
-.sidebar-maptopic {
-  .sidebar-article {
-    position: relative;
+            return $getPool->bindTo($cache, SymfonyDoctrineProvider::class)();
+        }
 
-    &::before {
-      content: "";
-      position: absolute;
-      left: $spacer-4;
-      height: 100%;
-      border-left: 1px solid var(--color-auto-blue-7);
-      width: 1px;
-      top: 0;
+        return new self($cache);
     }
 
-    &.active {
-      &::before {
-        border-left: 3px solid var(--color-auto-blue-7);
-      }
+    private function __construct(Cache $cache)
+    {
+        $this->cache = $cache;
     }
-  }
-}
 
-// only display child lists of active elements in sidebar
-.sidebar-product.active > ul,
-.sidebar-category.active > ul,
-.sidebar-maptopic.active > ul {
-  display: block;
-}
+    /** @internal */
+    public function getCache(): Cache
+    {
+        return $this->cache;
+    }
 
-.sidebar-category {
-  > ul {
-    display: none;
-  }
-}
+    /**
+     * {@inheritDoc}
+     */
+    public function getItem($key): CacheItemInterface
+    {
+        assert(self::validKey($key));
 
-.sidebar-maptopic > ul {
-  display: none;
-}![48367312_559189364546573_8430410895217131520_n](https://user-images.githubusercontent.com/83235895/116118245-4a59fe00-a6e7-11eb-875a-5815a22e3749.jpg)
+        if (isset($this->deferredItems[$key])) {
+            $this->commit();
+        }
+
+        $value = $this->cache->fetch($key);
+
+        if ($value !== false) {
+            return new CacheItem($key, $value, true);
+        }
+
+        return new CacheItem($key, null, false);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getItems(array $keys = []): array
+    {
+        if ($this->deferredItems) {
+            $this->commit();
+        }
+
+        assert(self::validKeys($keys));
+
+        $values = $this->doFetchMultiple($keys);
+        $items  = [];
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $values)) {
+                $items[$key] = new CacheItem($key, $values[$key], true);
+            } else {
+                $items[$key] = new CacheItem($key, null, false);
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function hasItem($key): bool
+    {
+        assert(self::validKey($key));
+
+        if (isset($this->deferredItems[$key])) {
+            $this->commit();
+        }
+
+        return $this->cache->contains($key);
+    }
+
+    public function clear(): bool
+    {
+        $this->deferredItems = [];
+
+        if (! $this->cache instanceof ClearableCache) {
+            return false;
+        }
+
+        return $this->cache->deleteAll();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function deleteItem($key): bool
+    {
+        assert(self::validKey($key));
+        unset($this->deferredItems[$key]);
+
+        return $this->cache->delete($key);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function deleteItems(array $keys): bool
+    {
+        foreach ($keys as $key) {
+            assert(self::validKey($key));
+            unset($this->deferredItems[$key]);
+        }
+
+        return $this->doDeleteMultiple($keys);
+    }
+
+    public function save(CacheItemInterface $item): bool
+    {
+        return $this->saveDeferred($item) && $this->commit();
+    }
+
+    public function saveDeferred(CacheItemInterface $item): bool
+    {
+        if (! $item instanceof CacheItem) {
+            return false;
+        }
+
+        $this->deferredItems[$item->getKey()] = $item;
+
+        return true;
+    }
+
+    public function commit(): bool
+    {
+        if (! $this->deferredItems) {
+            return true;
+        }
+
+        $now         = microtime(true);
+        $itemsCount  = 0;
+        $byLifetime  = [];
+        $expiredKeys = [];
+
+        foreach ($this->deferredItems as $key => $item) {
+            $lifetime = ($item->getExpiry() ?? $now) - $now;
+
+            if ($lifetime < 0) {
+                $expiredKeys[] = $key;
+
+                continue;
+            }
+
+            ++$itemsCount;
+            $byLifetime[(int) $lifetime][$key] = $item->get();
+        }
+
+        switch (count($expiredKeys)) {
+            case 0:
+                break;
+            case 1:
+                $this->cache->delete(current($expiredKeys));
+                break;
+            default:
+                $this->doDeleteMultiple($expiredKeys);
+                break;
+        }
+
+        if ($itemsCount === 1) {
+            return $this->cache->save($key, $item->get(), (int) $lifetime);
+        }
+
+        $success = true;
+        foreach ($byLifetime as $lifetime => $values) {
+            $success = $this->doSaveMultiple($values, $lifetime) && $success;
+        }
+
+        return $success;
+    }
+
+    public function __destruct()
+    {
+        $this->commit();
+    }
+
+    /**
+     * @param mixed $key
+     */
+    private static function validKey($key): bool
+    {
+        if (! is_string($key)) {
+            throw new InvalidArgument(sprintf('Cache key must be string, "%s" given.', is_object($key) ? get_class($key) : gettype($key)));
+        }
+
+        if ($key === '') {
+            throw new InvalidArgument('Cache key length must be greater than zero.');
+        }
+
+        if (strpbrk($key, self::RESERVED_CHARACTERS) !== false) {
+            throw new InvalidArgument(sprintf('Cache key "%s" contains reserved characters "%s".', $key, self::RESERVED_CHARACTERS));
+        }
+
+        return true;
+    }
+
+    /**
+     * @param mixed[] $keys
+     */
+    private static function validKeys(array $keys): bool
+    {
+        foreach ($keys as $key) {
+            self::validKey($key);
+        }
+
+        return true;
+    }
+
+    /**
+     * @param mixed[] $keys
+     */
+    private function doDeleteMultiple(array $keys): bool
+    {
+        if ($this->cache instanceof MultiDeleteCache) {
+            return $this->cache->deleteMultiple($keys);
+        }
+
+        $success = true;
+        foreach ($keys as $key) {
+            $success = $this->cache->delete($key) && $success;
+        }
+
+        return $success;
+    }
+
+    /**
+     * @param mixed[] $keys
+     *
+     * @return mixed[]
+     */
+    private function doFetchMultiple(array $keys): array
+    {
+        if ($this->cache instanceof MultiGetCache) {
+            return $this->cache->fetchMultiple($keys);
+        }
+
+        $values = [];
+        foreach ($keys as $key) {
+            $value = $this->cache->fetch($key);
+            if (! $value) {
+                continue;
+            }
+
+            $values[$key] = $value;
+        }
+
+        return $values;
+    }
+
+    /**
+     * @param mixed[] $keysAndValues
+     */
+    private function doSaveMultiple(array $keysAndValues, int $lifetime = 0): bool
+    {
+        if ($this->cache instanceof MultiPutCache) {
+            return $this->cache->saveMultiple($keysAndValues, $lifetime);
+        }
+
+        $success = true;
+        foreach ($keysAndValues as $key => $value) {
+            $success = $this->cache->save($key, $value, $lifetime) && $success;
+        }
+
+        return $success;
+    }
+}
